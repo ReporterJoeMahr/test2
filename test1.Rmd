@@ -1,0 +1,133 @@
+---
+title: "markdown_test"
+author: "Joe Mahr"
+date: '2022-10-12'
+output: html_document
+---
+
+```{r setup, results=F, message=F, warning=F}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Test of R Markdown
+
+Let's first download data, like this:
+
+```{r, results=F, message=F, warning=F} 
+
+#These are the libraries we'll need
+library(tidyverse)
+library(lubridate)
+
+#Here is our data, which we pull from our working directory:
+SA_dispositions <- read_csv("data/SA_dispositions.csv")
+```
+
+Now let's crunch it, to produce something:
+
+```{r, results=F, message=F, warning=F}
+#This adds some columns we'll need later and limits dispositions to pre-2022: 
+SA_dispositions_thru_2021 <- SA_dispositions %>% 
+  mutate(DISPOSITION_DATE=mdy_hms(DISPOSITION_DATE)) %>% 
+  mutate(ARREST_DATE=as.Date(mdy_hms(ARREST_DATE))) %>% 
+  arrange(desc(DISPOSITION_DATE)) %>% 
+  filter(DISPOSITION_DATE<="2021-12-31") 
+```
+
+One tricky part of this is determining WHEN a case has been disposed. Typically, cases have one date where a decision is made: guilty or not guilty. But not always. Each defendant can face multiple charges, which can be disposed at different times. So if that defendant was found guilty of any of those charges, the first date of any such guilty finding would be the date the case was disposed. If the defendant wasn't found guilty of any of the charges, then the last date of being found not guilty would be the date the case was disposed. (In essence, if someone is found guilty of any charge, the case enters a new phase, even if related charges remain pending. But if those earlier charges end up with not guilty dispositions, then the case continues in that pending phase until either a guilty finding on one of the charges, or all charges end with a not guilty finding.)
+
+So let's first separate those found guilty of anything, and then pick the earliest date they were found guilty of anything.
+
+```{r, results=F, message=F, warning=F}
+
+#This will take EARLIEST disposition date of these cases:
+
+murder_cases_participants_guilty <- SA_dispositions_thru_2021 %>% 
+  #This filters for murder cases:
+  filter(DISPOSITION_CHARGED_CLASS=="M") %>% 
+  #This lists all the possible ways murder cases end in a guilt finding:
+  filter(CHARGE_DISPOSITION=="Plea of Guilty - Amended Charge"|
+         CHARGE_DISPOSITION=="Plea Of Guilty"|
+         CHARGE_DISPOSITION=="Finding Guilty"|
+         CHARGE_DISPOSITION=="Verdict Guilty"|
+         CHARGE_DISPOSITION=="Finding Guilty - Lesser Included"|
+         CHARGE_DISPOSITION=="Plea of Guilty - Lesser Included"|
+         CHARGE_DISPOSITION=="Finding Guilty But Mentally Ill"|
+         CHARGE_DISPOSITION=="Verdict Guilty - Lesser Included"|
+         CHARGE_DISPOSITION=="Plea of Guilty But Mentally Ill"|
+         CHARGE_DISPOSITION=="Verdict Guilty - Amended Charge"|
+         CHARGE_DISPOSITION=="Finding Guilty - Amended Charge"|
+         CHARGE_DISPOSITION=="Plea of Guilty But Mentally Ill") %>% 
+  #Now that we've narrowed to just those guilty ones, let's find earliest disposition date:
+  select(CASE_ID,CASE_PARTICIPANT_ID,DISPOSITION_DATE,ARREST_DATE) %>% 
+  group_by(CASE_ID,CASE_PARTICIPANT_ID) %>% 
+  summarize(DISPOSITION_DATE=min(DISPOSITION_DATE),
+            ARREST_DATE=min(ARREST_DATE)) %>% 
+  #This creates a category that we'll use later during an append operation:
+  mutate(RESULT="Guilty") 
+```
+
+Now we have one group that we've determined ended up being guilty of something. Let's figure out the other group -- the one that walked away without a guilty finding on any charges tied to a murder case.
+  
+```{r, results=F, message=F, warning=F}  
+
+murder_cases_participants_not_guilty <- SA_dispositions_thru_2021 %>% 
+  #Again, filtering for murder cases
+  filter(DISPOSITION_CHARGED_CLASS=="M") %>% 
+  #Now, asking for every case/participant NOT included in our dataframe of guilty participants 
+  anti_join(murder_cases_participants_guilty, by=c("CASE_ID","CASE_PARTICIPANT_ID")) %>% 
+    #Now that we've narrowed to not guilty ones, let's find latest disposition date:
+  select(CASE_ID,CASE_PARTICIPANT_ID,DISPOSITION_DATE,ARREST_DATE) %>% 
+  group_by(CASE_ID,CASE_PARTICIPANT_ID) %>% 
+  summarize(DISPOSITION_DATE=max(DISPOSITION_DATE),
+            ARREST_DATE=min(ARREST_DATE)) %>% 
+  #Again, creating a category that we'll use later during an append operation:
+  mutate(RESULT="Not Guilty")
+
+```
+
+We have two sets of data here, both with the same field layout. One is of guilty participants. The other is of those not found guilty of anything. Let's combine them into one dataset.
+
+```{r, results=F, message=F, warning=F}  
+
+murder_defendants_dispositions_fixed <- rbind(murder_cases_participants_not_guilty,
+                                    murder_cases_participants_guilty) %>% 
+  #This eliminates any cases that don't have a disposition date. The good news is that all 2,077 cases in this data drop list a disposition date. But this next line is here just in case, as a safety to avoid pitfalls in later steps.
+  filter(!is.na(DISPOSITION_DATE)) %>% 
+  #...but unfortunately that are 26 of 2077 (1.2%) of dispositions that don't list an arrest date. We can't analyze those and must filter them out:
+  filter(!is.na(ARREST_DATE))
+
+```
+
+Now that we have a set of actions, for each murder case, we can begin computing statistics.
+
+```{r, results=F, message=F, warning=F}
+
+#This calculates the number of days to dispose of each case:
+murder_defendants_dispositions_time <- murder_defendants_dispositions_fixed %>% 
+  mutate(Disp_year=year(DISPOSITION_DATE)) %>% 
+  mutate(Disp_days=difftime(DISPOSITION_DATE,ARREST_DATE, units = "days"))
+
+#This determines our median (half longer/ half shorter) disposition times, by year of case disposed:
+murder_defendants_dispositions_time_stats_median <- murder_defendants_dispositions_time %>% 
+  select(Disp_year,Disp_days) %>% 
+  group_by(Disp_year) %>% 
+  summarize(count=n(),
+            Disp_days=as.numeric(median(Disp_days))) %>% 
+  #This converts to years, using avg days in year of 365.25
+  mutate(Median_years=round(Disp_days/365.25,1))
+
+murder_defendants_dispositions_time_median_years <- murder_defendants_dispositions_time_stats_median %>% 
+  #This renames some columns
+  rename(Year_of_Disposition=Disp_year,
+         Median_Years_to_Dispose=Median_years) %>% 
+  select(Year_of_Disposition,Median_Years_to_Dispose)
+
+```
+
+Now let's see what this looks like:
+
+```{r, results=F, message=F, warning=F}
+ggplot(murder_defendants_dispositions_time_median_years, aes(x=Year_of_Disposition, y=Median_Years_to_Dispose)) + 
+  geom_bar(stat = "identity")
+````
